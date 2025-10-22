@@ -1,0 +1,571 @@
+local useDebug = Config.Debug
+
+local RacingCrews = {}   -- This table will hold the racing crews locally, indexed by crew name
+-- ActiveInvites removido - agora usando sistema de REQUEST do VRP
+
+-- Load crews from database on startup
+local function loadCrewsFromDatabase()
+    print('DEBUG: Loading crews from database...')
+    local crews = MySQL.Sync.fetchAll('SELECT * FROM racing_crews', {})
+    if crews then
+        for _, crew in pairs(crews) do
+            local crewMembers = {}
+            
+            -- Parse members from JSON column
+            if crew.members and crew.members ~= '[]' then
+                local success, members = pcall(json.decode, crew.members)
+                if success and members then
+                    crewMembers = members
+                end
+            end
+            
+            RacingCrews[crew.crew_name] = {
+                id = crew.id,
+                crewName = crew.crew_name,
+                founderName = crew.founder_name,
+                founderCitizenid = crew.founder_citizenid,
+                members = crewMembers,
+                wins = crew.wins or 0,
+                races = crew.races or 0,
+                rank = crew.rank or 0
+            }
+        end
+        print('DEBUG: Loaded', #crews, 'crews from database')
+        for crewName, crew in pairs(RacingCrews) do
+            print('DEBUG: Crew loaded:', crewName, 'with', #crew.members, 'members')
+        end
+    else
+        print('DEBUG: No crews found in database')
+    end
+end
+
+-- Load crews when script starts
+CreateThread(function()
+    Wait(3000) -- Wait for MySQL to be ready
+    loadCrewsFromDatabase()
+end)
+
+-- Helper functions
+
+local function getRacingCrewThatCitizenIDIsIn(citizenId)
+    if useDebug then print('Checking crew for citizenId:', citizenId, 'type:', type(citizenId)) end
+    
+    for crewName, crew in pairs(RacingCrews) do
+        if useDebug then print('Checking crew:', crewName, 'founder:', crew.founderCitizenid, 'type:', type(crew.founderCitizenid)) end
+        
+        if tostring(crew.founderCitizenid) == tostring(citizenId) then
+            if useDebug then print('Found as founder of crew:', crewName) end
+            return crew
+        end
+        
+        for _, member in ipairs(crew.members) do
+            if useDebug then print('Checking member:', member.citizenID, 'type:', type(member.citizenID)) end
+            if tostring(member.citizenID) == tostring(citizenId) then
+                if useDebug then print('Found as member of crew:', crewName) end
+                return crew
+            end
+        end
+    end
+
+    if useDebug then print('No crew found for citizenId:', citizenId) end
+    return nil -- Player is not in any racing crew
+end
+
+local function changeRacerCrew(src,racerName, selectedCrew)
+    if useDebug then print('Changing racer crew for', src, selectedCrew) end
+    RADB.setActiveRacerCrew(racerName, selectedCrew)
+end
+
+-- SQL calling functions
+
+local function joinRacingCrew(memberName, citizenId, crewName)
+    if useDebug then print('Joining crew:', memberName, citizenId, crewName) end
+    
+    local result = RADB.joinRacingCrew(citizenId, memberName, crewName)
+    if result then
+        if RacingCrews[crewName] then
+            local newMember = {
+                citizenID = citizenId,
+                racername = memberName,
+                rank = 0
+            }
+            table.insert(RacingCrews[crewName].members, newMember)
+            if useDebug then print('Added member to local crew:', json.encode(newMember)) end
+        end
+        return crewName
+    else
+        if useDebug then print('Failed to join crew in database') end
+    end
+
+    return false
+end
+
+local function createRacingCrew(founderName, citizenId, crewName)
+    if useDebug then print('Creating crew:', crewName, 'founder:', founderName, 'citizenId:', citizenId) end
+    
+    local result = RADB.createRacingCrew(crewName, founderName, citizenId)
+
+    if result then
+        local newCrew = {
+            id = result,
+            crewName = crewName,
+            founderName = founderName,
+            founderCitizenid = citizenId,
+            members = {},
+            wins = 0,
+            races = 0,
+            rank = 0
+        }
+
+        RacingCrews[crewName] = newCrew
+        if useDebug then print('Created crew in local table:', json.encode(newCrew)) end
+        
+        joinRacingCrew(founderName, citizenId, crewName)
+        RADB.setActiveRacerCrew(founderName, crewName)
+        return true
+    else
+        if useDebug then print('Failed to create crew in database') end
+    end
+    return false
+end
+
+local function leaveRacingCrew(citizenId, crewName)
+
+    local result = RADB.leaveRacingCrew(citizenId, crewName)
+    if result then
+        if RacingCrews[crewName] then
+            for i, member in ipairs(RacingCrews[crewName].members) do
+                if member.citizenID == citizenId then
+                    table.remove(RacingCrews[crewName].members, i)
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function addWinToCrew(crewName)
+    local result = RADB.increaseCrewWins(crewName)
+
+    if result and RacingCrews[crewName] then
+        RacingCrews[crewName].wins = RacingCrews[crewName].wins + 1
+        RacingCrews[crewName].races = RacingCrews[crewName].races + 1
+    end
+
+    return result
+end
+
+local function addRaceToCrew(crewName)
+    local result = RADB.increaseCrewRaces(crewName)
+
+    if result and RacingCrews[crewName] then
+        RacingCrews[crewName].races = RacingCrews[crewName].races + 1
+    end
+
+    return result
+end
+
+local function updateRanking(crewName, amount)
+    if not amount then
+        print('^1Input for ranking update was incorrect')
+        return
+    end
+
+    local result = RADB.changeCrewRank(crewName, amount)
+    if result and RacingCrews[crewName] then
+        RacingCrews[crewName].rank = RacingCrews[crewName].rank + amount
+    end
+
+    return result
+end
+
+local function disbandRacingCrew(crewName)
+    local result = RADB.disbandCrew(crewName)
+
+    if result then
+        if RacingCrews[crewName] then
+            for _, member in pairs(RacingCrews[crewName].members) do
+                local playerSrc = getSrcOfPlayerByCitizenId(member.citizenID)
+                if playerSrc ~= nil then
+                    TriggerClientEvent('cw-racingapp:client:notify', playerSrc, Lang("disbanded_crew"), 'error')
+                end
+            end
+            RacingCrews[crewName] = nil
+            return true
+        end
+    end
+
+    return false
+end
+
+-- invitations
+local function inviteToCrew(invitedBySource, invitedCitizenId, crewName)
+    local playerSrc = getSrcOfPlayerByCitizenId(invitedCitizenId)
+    if playerSrc ~= nil then
+        if getRacingCrewThatCitizenIDIsIn(invitedCitizenId) then
+            TriggerClientEvent('cw-racingapp:client:notify', invitedBySource, Lang("racer_already_in_crew"), 'error')
+            return false
+        end
+        
+        -- Usar sistema de REQUEST do VRP
+        local inviterName = GetPlayerName(invitedBySource) or "Desconhecido"
+        local requestMessage = "Você foi convidado para entrar na equipe de corrida <b>" .. crewName .. "</b> por <b>" .. inviterName .. "</b>"
+        
+        if useDebug then print(invitedBySource, 'is inviting player to crew', playerSrc) end
+        
+        -- Usar vRP.Request para enviar convite
+        local accepted = vRP.Request(playerSrc, "Convite para Equipe", requestMessage)
+        
+        if accepted then
+            -- Se aceitou, adicionar à equipe
+            local racerData = getActiveRacerName(invitedCitizenId)
+            if racerData and racerData.racername then
+                joinRacingCrew(racerData.racername, invitedCitizenId, crewName)
+                TriggerClientEvent('cw-racingapp:client:notify', invitedBySource, Lang("crew_invite_accepted"), 'success')
+                return true
+            else
+                TriggerClientEvent('cw-racingapp:client:notify', invitedBySource, "Jogador não possui nome de piloto registrado", 'error')
+                return false
+            end
+        else
+            TriggerClientEvent('cw-racingapp:client:notify', invitedBySource, Lang("crew_invite_rejected"), 'error')
+            return false
+        end
+    else
+        if useDebug then print('Could not find source for citizenid', invitedCitizenId) end
+        return false
+    end
+end
+
+-- Funções antigas removidas - agora usando sistema de REQUEST do VRP
+
+function HandleCrewEloUpdates(crewRes)
+    for i, crew in pairs(crewRes) do
+        if useDebug then print('Updating ELO for crew', crew.crewName, 'with', crew.totalChange) end
+        updateRanking(crew.crewName, crew.totalChange)
+        Wait(100)
+        if i == 1 then
+            addWinToCrew(crew.crewName)
+        else
+            addRaceToCrew(crew.crewName)
+        end
+        Wait(500)
+    end
+end
+
+function GetCrewRanking(crewName)
+    local currentCrew = RacingCrews[crewName]
+    if currentCrew then
+        if useDebug then print('crew existed with ranking', currentCrew.rank) end
+        return currentCrew.rank
+    else
+        if useDebug then print('crew didnt exist defaulting to 0') end
+        return 0
+    end
+end
+
+-- Event specific helpers
+
+local function canFounderCreateCrew(founderCitizenId)
+    for _, crew in ipairs(RacingCrews) do
+        for _, member in ipairs(crew.members) do
+            if member.citizenID == founderCitizenId then
+                return false -- Founder is already in a crew
+            end
+        end
+    end
+
+    return true
+end
+
+local function isMemberInCrew(citizenId, crewName)
+    local crew = RacingCrews[crewName]
+
+    if crew then
+        for _, member in ipairs(crew.members) do
+            print('meb', json.encode(member))
+            if member.citizenID == citizenId then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function canFounderDisbandCrew(founderCitizenId, crewName)
+    local crew = RacingCrews[crewName]
+    if useDebug then print('founder citizenid', crew.founderCitizenid) end
+    return (crew and tostring(crew.founderCitizenid) == tostring(founderCitizenId)) or false
+end
+
+-- Events
+RegisterServerEvent('cw-racingapp:server:changeCrew', function(racerName, crewName)
+    changeRacerCrew(source, racerName, crewName)
+end)
+
+-- Callbacks
+
+RegisterServerCallback('cw-racingapp:server:getCrewData', function(source, citizenId, crewName)
+    if useDebug then
+        print('^5Getting crew data for citizenId^0', citizenId, 'crewName', crewName)
+        print('all crews', json.encode(RacingCrews, {indent=true}))
+    end
+    return { invites = nil, crew = RacingCrews[crewName] } -- invites removido - usando REQUEST do VRP
+end)
+
+RegisterServerCallback('cw-racingapp:server:getMyCrew', function(source, citizenId)
+    if useDebug then
+        print('^5Getting my crew for citizenId^0', citizenId)
+    end
+    
+    local myCrew = getRacingCrewThatCitizenIDIsIn(citizenId)
+    if useDebug then
+        if myCrew then
+            print('^2Found crew for player^0:', myCrew.crewName)
+        else
+            print('^1No crew found for player^0')
+        end
+    end
+    
+    return { crew = myCrew }
+end)
+
+RegisterServerCallback('cw-racingapp:server:crewStillExists', function(source, racerCrew)
+
+    local crew = RacingCrews[racerCrew]
+    if useDebug then print('Result for racing crew check', racerCrew, json.encode(crew, {indent=true})) end
+    if crew then
+        return true
+    else
+        return false
+    end
+end)
+
+RegisterServerCallback('cw-racingapp:server:getAllCrews', function(source)
+    if useDebug then print('Getting all racing crews', json.encode(RacingCrews, { indent = true })) end
+    return RacingCrews
+end)
+
+RegisterServerCallback('cw-racingapp:server:sendInvite', function(source, invitedBySource, invitedCitizenId, crewName)
+    if useDebug then print(invitedBySource, ' is Inviting ', invitedCitizenId, ' to', crewName) end
+    return inviteToCrew(invitedBySource, invitedCitizenId, crewName)
+end)
+
+RegisterServerCallback('cw-racingapp:server:sendInviteClosest',
+    function(source, invitedBySource, invitedSource, crewName)
+        local citizenId = getCitizenId(invitedSource)
+        if not citizenId then return TriggerClientEvent('cw-racingapp:client:notify', source, Lang("person_no_exist"),
+                'error') end
+
+        if useDebug then print('Using Closest', invitedBySource, ' is Inviting ', citizenId, ' to', crewName) end
+        return inviteToCrew(invitedBySource, citizenId, crewName)
+    end)
+
+-- Callbacks antigos removidos - agora usando sistema de REQUEST do VRP
+
+RegisterServerCallback('cw-racingapp:server:createCrew', function(source, founderName, founderCitizenId, crewName)
+    local canCreateCrew = canFounderCreateCrew(founderCitizenId)
+    local trimmedCrewName = string.gsub(crewName, '^%s*(.-)%s*$', '%1')
+    if RacingCrews[trimmedCrewName] then
+        TriggerClientEvent('cw-racingapp:client:notify', source, Lang("name_taken"), 'error')
+        return false
+    end
+    if canCreateCrew then
+        if useDebug then print('Player can create ') end
+
+        return createRacingCrew(founderName, founderCitizenId, trimmedCrewName)
+    else
+        TriggerClientEvent('cw-racingapp:client:notify', source, Lang("disband_crew_first"), 'error')
+    end
+    return false
+end)
+
+RegisterServerCallback('cw-racingapp:server:joinCrew', function(source, memberName, citizenId, crewName)
+    local canJoinCrew = isMemberInCrew(citizenId, crewName)
+
+    if canJoinCrew then
+        return joinRacingCrew(memberName, citizenId, crewName)
+    else
+        print("Error: Member cannot join the crew")
+    end
+    return false
+end)
+
+RegisterServerCallback('cw-racingapp:server:leaveCrew', function(source, memberName, citizenId, crewName)
+    if not RacingCrews[crewName] then
+        if useDebug then print('The racing crew did not exist') end
+        changeRacerCrew(source,memberName, nil)
+    end
+    local canLeaveCrew = isMemberInCrew(citizenId, crewName)
+    local isFounder = canFounderDisbandCrew(citizenId, crewName)
+
+    if isFounder then
+        TriggerClientEvent('cw-racingapp:client:notify', source, Lang("founder_can_not_leave"), 'error')
+    end
+    if canLeaveCrew then
+        changeRacerCrew(source,memberName, nil)
+        return leaveRacingCrew(citizenId, crewName)
+    else
+        if useDebug then print("Error: Member cannot leave the crew") end
+        changeRacerCrew(source,memberName, nil)
+        return true
+    end
+end)
+
+RegisterServerCallback('cw-racingapp:server:kickMemberFromCrew', function(source, memberName, citizenId, crewName)
+    local userCurrentSource = getSrcOfPlayerByCitizenId(citizenId)
+    if not RacingCrews[crewName] then
+        if useDebug then print('The racing crew did not exist') end
+        changeRacerCrew(userCurrentSource, memberName, nil)
+    end
+    local canLeaveCrew = isMemberInCrew(citizenId, crewName)
+    local isFounder = canFounderDisbandCrew(citizenId, crewName)
+
+    if isFounder then
+        TriggerClientEvent('cw-racingapp:client:notify', source, Lang("founder_can_not_leave"), 'error')
+    end
+    if canLeaveCrew then
+        changeRacerCrew(userCurrentSource, memberName, nil)
+        return leaveRacingCrew(citizenId, crewName)
+    else
+        if useDebug then print("Error: Member cannot leave the crew") end
+        changeRacerCrew(userCurrentSource,memberName, nil)
+        return true
+    end
+end)
+
+RegisterServerCallback('cw-racingapp:server:disbandCrew', function(source, founderCitizenId, crewName)
+    if useDebug then print(founderCitizenId, 'is disbanding crew', crewName) end
+    local canDisbandCrew = canFounderDisbandCrew(founderCitizenId, crewName)
+
+    if canDisbandCrew then
+        return disbandRacingCrew(crewName)
+    else
+        print("Error: Only the founder can disband the crew")
+    end
+    return false
+end)
+
+-- On start
+AddEventHandler('onResourceStart', function(resourceName)
+    if GetCurrentResourceName() == resourceName then
+        MySQL.ready(function()
+            local result = RADB.getAllCrews()
+            if result then
+                for _, row in ipairs(result) do
+                    local crew = {
+                        id = row.id,
+                        crewName = row.crew_name,
+                        founderName = row.founder_name,
+                        founderCitizenid = row.founder_citizenid,
+                        members = json.decode(row.members) or {},
+                        wins = row.wins,
+                        races = row.races,
+                        rank = row.rank
+                    }
+
+                    RacingCrews[row.crew_name] = crew
+                end
+            else
+                print("Error fetching racing crews from database")
+            end
+        end)
+    end
+end)
+
+if useDebug then
+    -- Debugging
+    registerCommand('createracingcrew', "Create a new racing crew", {
+        { name = 'founder',   help = 'Founder name' },
+        { name = 'citizenid', help = 'Citizen ID' },
+        { name = 'crew',      help = 'Crew name' },
+    }, true, function(source, args)
+        print('Creating racing crew for', args[1], 'citizenid', args[2], 'named', args[3])
+        createRacingCrew(args[1], args[2], args[3])
+    end, true)
+    
+    registerCommand('joinracingcrew', "Join a racing crew", {
+        { name = 'member',    help = 'Member name' },
+        { name = 'citizenid', help = 'Citizen ID' },
+        { name = 'crew',      help = 'Crew name' },
+    }, true, function(source, args)
+        print(args[1], 'joining racing crew', args[3])
+        joinRacingCrew(args[1], args[2], args[3])
+    end, true)
+    
+    registerCommand('leaveracingcrew', "Leave a racing crew", {
+        { name = 'citizenid', help = 'Citizen ID' },
+        { name = 'crew',      help = 'Crew name' },
+    }, true, function(source, args)
+        print(args[1], 'leaving racing crew', args[2])
+        leaveRacingCrew(args[1], args[2])
+    end, true)
+    
+    registerCommand('addwintocrew', "Add a win to a racing crew", {
+        { name = 'crew', help = 'Crew name' },
+    }, true, function(source, args)
+        print('Adding a win to racing crew', args[1])
+        addWinToCrew(args[1])
+    end, true)
+    
+    registerCommand('addracetocrew', "Add a race to a racing crew", {
+        { name = 'crew', help = 'Crew name' },
+    }, true, function(source, args)
+        print('Adding a race to racing crew', args[1])
+        addRaceToCrew(args[1])
+    end, true)
+    
+    registerCommand('updateranking', "add/remove rank for a racing crew", {
+        { name = 'crew',   help = 'Crew name' },
+        { name = 'amount', help = 'How much do you want to increase/decrease with' },
+    }, true, function(source, args)
+        print('changing rank of racing crew', args[1], 'with', args[2])
+        updateRanking(args[1], args[2])
+    end, true)
+    
+    registerCommand('disbandracingcrew', "Disband a racing crew", {
+        { name = 'crew', help = 'Crew name' },
+    }, true, function(source, args)
+        print('Disbanding racing crew', args[1])
+        disbandRacingCrew(args[1])
+    end, true)
+    
+    registerCommand('printracingcrews', "Print racing crews", {
+    }, true, function(source, args)
+        print(json.encode(RacingCrews))
+    end, true)
+    
+    registerCommand('printinvites', "Print racing crews", {
+    }, true, function(source, args)
+        print("ActiveInvites removido - usando sistema de REQUEST do VRP")
+    end, true)
+    
+    registerCommand('reloadcrews', "Reload crews from database", {
+    }, true, function(source, args)
+        print("Reloading crews from database...")
+        RacingCrews = {} -- Clear current crews
+        loadCrewsFromDatabase()
+        print("Crews reloaded!")
+    end, true)
+    
+    registerCommand('checkcrew', "Check crew for player", {
+        { name = 'source', help = 'Player source' }
+    }, true, function(source, args)
+        local targetSource = tonumber(args[1]) or source
+        local citizenId = getCitizenId(targetSource)
+        local playerName = GetPlayerName(targetSource) or "Unknown"
+        
+        print("Checking crew for player:", playerName, "citizenId:", citizenId)
+        local crew = getRacingCrewThatCitizenIDIsIn(citizenId)
+        
+        if crew then
+            print("Player is in crew:", crew.crewName)
+            print("Crew data:", json.encode(crew, {indent=true}))
+        else
+            print("Player is not in any crew")
+        end
+    end, true)
+end
